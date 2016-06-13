@@ -15,7 +15,7 @@ cabal-version:       >=1.10
 
 library
   hs-source-dirs:      src
-  exposed-modules:     Lib
+  exposed-modules:     Control.Monad.Seksek
   build-depends:       base >= 4.7 && < 5
                      , hbeanstalk
                      , aeson
@@ -26,6 +26,8 @@ library
                      , vector
                      , operational
   default-language:    Haskell2010
+  exposed: True
+  buildable: True
 
 executable heksek-exe
   hs-source-dirs:      app

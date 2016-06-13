@@ -2,7 +2,7 @@
 
 module Main where
 
-import Lib
+import Control.Monad.Seksek
 
 test_service :: SeksekHandler (Double, Double) Double
 test_service = SeksekHandler "test_service"

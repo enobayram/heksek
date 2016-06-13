@@ -1,7 +1,7 @@
 {-# LANGUAGE TemplateHaskell, GADTs #-}
 {-# OPTIONS_GHC -Wall -fno-warn-unused-binds #-}
 
-module Lib (
+module Control.Monad.Seksek (
   SeksekHandler(..), SeksekProgram, getInit, remote, remember, serveSeksek,
   initialJob, sendJob,
   ) where
