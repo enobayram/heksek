@@ -17,7 +17,7 @@ import Data.Aeson.TH (deriveJSON)
 import Data.String (fromString)
 import Data.Typeable
 import qualified Data.Vector as V
-import Control.Monad.Except (throwError, liftIO, runExceptT)
+import Control.Monad.Except (throwError, liftIO, runExceptT, ExceptT, MonadIO)
 import Control.Monad
 import Control.Error.Util ((??), note, hoistEither)
 import Control.Monad.Operational (Program, singleton, view, ProgramViewT(..))
@@ -97,7 +97,7 @@ stepSeksek curIdx hid (before, after) m = if curIdx < hid
     Remember _ :>>= k -> stepReplay k
   else assertAfterEmpty >>| case view m of
     Return a -> Tell a
-    Remote h a :>>= k -> Ask h (makeContinuation (hid+1) before) a k
+    Remote h a :>>= k -> Ask h (makeContinuation (curIdx+1) before) a k
     Remember a :>>= k -> Perform a $ \out -> stepSeksek (curIdx+1) hid (toJSON out:before, after) $ k out
   where
     ma >>| b = ma >> return b
@@ -133,31 +133,33 @@ serveSeksek host port appname prog' = let prog = getInit >>= prog' in forever $ 
 readErr :: Read a => String -> IO (Either String a)
 readErr msg = fmap (note msg . readMay) getLine
 
+mockStep :: MonadIO m => Int -> [Value] -> SeksekProgram () -> ExceptT String m ()
+mockStep stepId state prog = do
+      instruction <- hoistEither $ stepSeksek stepId stepId (state,[]) prog
+      let handle (Ask handler cont service_input rest) = do
+            liftIO $ do
+              putStrLn $ "Service " ++ show (tubeName handler) ++ " is called with:"
+              BSL.putStrLn $ encode service_input
+              putStrLn "Along with the continuation:"
+              BSL.putStrLn $ encode cont
+              putStrLn "Please enter a response mocking the service"
+            mockResponse' <- liftIO BS.getLine
+            mockResponse <- decodeStrict' mockResponse' ?? "Unable to decode the response"
+            let Success nextState = fromJSON $ appstate cont
+            mockStep (handler_id cont) nextState $ rest mockResponse
+          handle (Tell ()) = return ()
+          handle (Perform action cont) = do
+            out <- liftIO action
+            next <- hoistEither $ cont out
+            handle next
+      handle instruction
+
 mockSeksek :: (Typeable a, Read a) => (a -> SeksekProgram ()) -> IO ()
 mockSeksek prog' = do
   result <- runExceptT $ do
     rec
       liftIO $ putStrLn $ "Enter a value of type " ++ show (typeOf inp)
       inp <- hoistEither =<< liftIO (readErr "Couldn't parse the value as the appropriate type")
-    let mockStep stepId state prog = do
-          instruction <- hoistEither $ stepSeksek stepId stepId (state,[]) prog
-          let handle (Ask handler cont service_input rest) = do
-                liftIO $ do
-                  putStrLn $ "Service " ++ show (tubeName handler) ++ " is called with:"
-                  BSL.putStrLn $ encode service_input
-                  putStrLn "Along with the continuation:"
-                  BSL.putStrLn $ encode cont
-                  putStrLn "Please enter a response mocking the service"
-                mockResponse' <- liftIO BS.getLine
-                mockResponse <- decodeStrict' mockResponse' ?? "Unable to decode the response"
-                let Success nextState = fromJSON $ appstate cont
-                mockStep (stepId+1) nextState $ rest mockResponse
-              handle (Tell ()) = return ()
-              handle (Perform action cont) = do
-                out <- liftIO action
-                next <- hoistEither $ cont out
-                handle next
-          handle instruction
     mockStep 0 [] $ prog' inp
   case result of
     Left err -> putStrLn $ "Error! " ++ err
