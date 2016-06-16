@@ -17,7 +17,12 @@ testProg inp = do
     return usr
   let req = (inp, usr)
   out <- remote test_service req
-  remember $ putStrLn $ "Received " ++ show out ++ " from test service for " ++ show req ++ "!"
+  another <- remember $ do
+    putStrLn $ "Received " ++ show out ++ " from test service for " ++ show req ++ "!"
+    putStrLn "Let's try another number:"
+    readLn
+  final <- remote test_service (out, another)
+  remember $ putStrLn $ "Finally, received " ++ show final
 
 main :: IO ()
 main = serveSeksek "localhost" "11300" "heksektest" testProg
