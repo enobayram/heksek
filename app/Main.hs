@@ -7,9 +7,8 @@ import Control.Monad.Seksek
 test_service :: SeksekHandler (Double, Double) Double
 test_service = SeksekHandler "test_service"
 
-testProg :: SeksekProgram ()
-testProg = do
-  inp <- getInit
+testProg :: Double -> SeksekProgram ()
+testProg inp = do
   usr <- remember $ do
     putStrLn $ "Received: " ++ show inp
     putStrLn "Input some number:"
