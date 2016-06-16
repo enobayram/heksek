@@ -16,9 +16,9 @@ import Data.Aeson (defaultOptions, Value(Array), ToJSON, FromJSON, encode,
 import Data.Aeson.TH (deriveJSON)
 import Data.String (fromString)
 import qualified Data.Vector as V
-import Control.Monad.Except (ExceptT, throwError, liftIO, runExceptT)
+import Control.Monad.Except (throwError, liftIO, runExceptT)
 import Control.Monad
-import Control.Error.Util ((??))
+import Control.Error.Util ((??), note, hoistEither)
 import Control.Monad.Operational (Program, singleton, view, ProgramViewT(..))
 
 data SeksekRequestMeta fwd = SeksekRequestMeta {
@@ -77,27 +77,35 @@ safeSplit [] = Nothing
 
 type StateZipper = ([Value], [Value])
 
-stepSeksek :: BeanstalkServer -> Int -> Int -> StateZipper -> String -> SeksekProgram () -> ExceptT String IO ()
-stepSeksek con curIdx hid (before, after) appname m =
+data SeksekInstruction a where
+  Ask :: (ToJSON inp, FromJSON out) =>
+    SeksekHandler inp out -> SeksekContinuation Value ->
+    inp -> (out -> SeksekProgram a) -> SeksekInstruction a
+  Tell :: a -> SeksekInstruction a
+  Perform :: IO out -> (out -> Either String (SeksekInstruction a)) -> SeksekInstruction a
+
+(?<) :: Maybe b -> a -> Either a b
+(?<) = flip note
+
+stepSeksek :: Int -> Int -> StateZipper -> SeksekProgram a -> Either String (SeksekInstruction a)
+stepSeksek curIdx hid (before, after) m =
   if curIdx > hid then throwError "Internal Error!" else case view m of
-    Return () -> unless(curIdx == hid) $ throwError "No more steps remaining"
+    Return a -> if curIdx == hid then return $ Tell a else throwError "No more steps remaining"
     Remote h a :>>= k -> if curIdx < hid
       then do
-        (next, rest) <- safeSplit after ?? "The state array is too short!"
-        out <- maybeFromJSON next ?? ("Failed to decode output from seksek response:" ++ show next)
-        stepSeksek con (curIdx+1) hid (next:before, rest) appname $ k out
+        (next, rest) <- safeSplit after ?< "The state array is too short!"
+        out <- maybeFromJSON next ?< ("Failed to decode output from seksek response:" ++ show next)
+        stepSeksek (curIdx+1) hid (next:before, rest) $ k out
       else case after of -- curIdx == hid
-        [] -> liftIO $ call_service con h appname (makeContinuation (hid+1) before) a
+        [] -> return $ Ask h (makeContinuation (hid+1) before) a k
         _  -> throwError "Internal Error! The 'after' list should be empty."
     Remember a :>>= k -> if curIdx < hid
       then do
-        (next, rest) <- safeSplit after ?? "The state array is too short!"
-        out <- maybeFromJSON next ?? ("Failed to decode previously remembered value:" ++ show next)
-        stepSeksek con curIdx hid (next:before, rest) appname $ k out
+        (next, rest) <- safeSplit after ?< "The state array is too short!"
+        out <- maybeFromJSON next ?< ("Failed to decode previously remembered value:" ++ show next)
+        stepSeksek curIdx hid (next:before, rest) $ k out
       else case after of
-        [] -> do
-          out <- liftIO a
-          stepSeksek con curIdx hid (toJSON out:before, after) appname $ k out
+        [] -> return $ Perform a $ \out -> stepSeksek curIdx hid (toJSON out:before, after) $ k out
         _ -> throwError "Internal Error! The 'after' list should be empty."
 
 serveSeksek :: String -> String -> String -> SeksekProgram () -> IO ()
@@ -110,7 +118,14 @@ serveSeksek host port appname prog = forever $ do
     result <- runExceptT $ do
       SeksekResponse rbody (SeksekContinuation hid st) <- resp ?? "Couldn't decode a SeksekResponse from the job body"
       stArr <- maybeFromJSON st ?? "The state needs to be a JSON array"
-      stepSeksek con 0 hid ([], V.toList stArr ++ [rbody] ) appname prog
+      instruction <- hoistEither $ stepSeksek 0 hid ([], V.toList stArr ++ [rbody] ) prog
+      let handle (Ask handler cont inp _) = liftIO $ call_service con handler appname cont inp
+          handle (Tell ()) = return ()
+          handle (Perform action cont) = do
+            out <- liftIO action
+            next <- hoistEither $ cont out
+            handle next
+      handle instruction
     case result of
       Right () -> deleteJob con $ job_id job
       Left err -> putStrLn err >> buryJob con (job_id job) 0
