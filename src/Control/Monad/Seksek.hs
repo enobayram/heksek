@@ -90,22 +90,22 @@ data SeksekInstruction a where
 (?<) = flip note
 
 stepSeksek :: Int -> Int -> StateZipper -> SeksekProgram a -> Either String (SeksekInstruction a)
-stepSeksek curIdx hid (before, after) m = case compare curIdx hid of
-  GT -> throwError "Internal Error! Current index is larger than the handler index."
-  LT -> case view m of
+stepSeksek curIdx hid (before, after) m = if curIdx < hid
+  then case view m of
     Return _ -> throwError "No more steps remaining"
-    Remote _ _ :>>= k -> stepReplay (curIdx+1) k
-    Remember _ :>>= k -> stepReplay curIdx k
-  EQ ->  assertAfterEmpty >> case view m of
-    Return a -> return $ Tell a
-    Remote h a :>>= k -> return $ Ask h (makeContinuation (hid+1) before) a k
-    Remember a :>>= k -> return $ Perform a $ \out -> stepSeksek curIdx hid (toJSON out:before, after) $ k out
+    Remote _ _ :>>= k -> stepReplay k
+    Remember _ :>>= k -> stepReplay k
+  else assertAfterEmpty >>| case view m of
+    Return a -> Tell a
+    Remote h a :>>= k -> Ask h (makeContinuation (hid+1) before) a k
+    Remember a :>>= k -> Perform a $ \out -> stepSeksek (curIdx+1) hid (toJSON out:before, after) $ k out
   where
-    stepReplay :: FromJSON b => Int -> (b -> SeksekProgram a) -> Either String (SeksekInstruction a)
-    stepReplay targetId cont = do
+    ma >>| b = ma >> return b
+    stepReplay :: FromJSON b => (b -> SeksekProgram a) -> Either String (SeksekInstruction a)
+    stepReplay cont = do
       (next, rest) <- safeSplit after ?< "The state array is too short!"
       out <- maybeFromJSON next ?< ("Failed to decode output from seksek response:" ++ show next)
-      stepSeksek targetId hid (next:before, rest) $ cont out
+      stepSeksek (curIdx+1) hid (next:before, rest) $ cont out
     assertAfterEmpty = unless (null after) $ throwError "Internal Error! The 'after' list should be empty."
 
 serveSeksek :: FromJSON a => String -> String -> String -> (a -> SeksekProgram ()) -> IO ()
