@@ -11,13 +11,12 @@ import Network.Beanstalk (BeanstalkServer, connectBeanstalk, useTube, watchTube,
                           job_id, JobState)
 import qualified Data.ByteString.Lazy.Char8 as BSL
 import qualified Data.ByteString.Char8 as BS
-import Data.Aeson (defaultOptions, Value(Array), ToJSON, FromJSON, encode,
+import Data.Aeson (defaultOptions, Value, ToJSON, FromJSON, encode,
                    toJSON, fromJSON, decodeStrict', Result(Success))
 import Data.Aeson.TH (deriveJSON)
 import Data.String (fromString)
 import Data.Typeable
-import qualified Data.Vector as V
-import Control.Monad.Except (throwError, liftIO, runExceptT, ExceptT, MonadIO)
+import Control.Monad.Except (throwError, liftIO, runExceptT, ExceptT)
 import Control.Monad
 import Control.Error.Util ((??), note, hoistEither)
 import Control.Monad.Operational (Program, singleton, view, ProgramViewT(..))
@@ -50,7 +49,7 @@ $(deriveJSON defaultOptions ''SeksekResponse)
 
 data SeksekHandler inp out = SeksekHandler {tubeName :: BS.ByteString} deriving Show
 
-call_service :: ToJSON inp => BeanstalkServer -> SeksekHandler inp out -> String -> SeksekContinuation Value -> inp -> IO ()
+call_service :: ToJSON inp => BeanstalkServer -> SeksekHandler inp out -> String -> SeksekContinuation [Value] -> inp -> IO ()
 call_service con srv app cont i = do
     useTube con $ tubeName srv
     _ <- putJob con 0 0 100 req_body
@@ -70,8 +69,8 @@ remember = singleton . Remember
 
 type SeksekProgram a = Program Seksek a
 
-makeContinuation :: Int -> [Value] -> SeksekContinuation Value
-makeContinuation hid before = SeksekContinuation hid $ Array $ V.reverse $ V.fromList before
+makeContinuation :: Int -> [Value] -> SeksekContinuation [Value]
+makeContinuation hid before = SeksekContinuation hid $ reverse before
 
 safeSplit :: [a] -> Maybe (a, [a])
 safeSplit (a:as) = Just (a,as)
@@ -81,7 +80,7 @@ type StateZipper = ([Value], [Value])
 
 data SeksekInstruction a where
   Ask :: (ToJSON inp, FromJSON out) =>
-    SeksekHandler inp out -> SeksekContinuation Value ->
+    SeksekHandler inp out -> SeksekContinuation [Value] ->
     inp -> (out -> SeksekProgram a) -> SeksekInstruction a
   Tell :: a -> SeksekInstruction a
   Perform :: IO out -> (out -> Either String (SeksekInstruction a)) -> SeksekInstruction a
@@ -89,7 +88,10 @@ data SeksekInstruction a where
 (?<) :: Maybe b -> a -> Either a b
 (?<) = flip note
 
-stepSeksek :: Int -> Int -> StateZipper -> SeksekProgram a -> Either String (SeksekInstruction a)
+type EitherInstruction a = Either String (SeksekInstruction a)
+type ExceptInstruction m a = ExceptT String m (SeksekInstruction a)
+
+stepSeksek :: Int -> Int -> StateZipper -> SeksekProgram a -> EitherInstruction a
 stepSeksek curIdx hid (before, after) m = if curIdx < hid
   then case view m of
     Return _ -> throwError "No more steps remaining"
@@ -101,7 +103,7 @@ stepSeksek curIdx hid (before, after) m = if curIdx < hid
     Remember a :>>= k -> Perform a $ \out -> stepSeksek (curIdx+1) hid (toJSON out:before, after) $ k out
   where
     ma >>| b = ma >> return b
-    stepReplay :: FromJSON b => (b -> SeksekProgram a) -> Either String (SeksekInstruction a)
+    stepReplay :: FromJSON b => (b -> SeksekProgram a) -> EitherInstruction a
     stepReplay cont = do
       (next, rest) <- safeSplit after ?< "The state array is too short!"
       out <- maybeFromJSON next ?< ("Failed to decode output from seksek response:" ++ show next)
@@ -118,13 +120,10 @@ serveSeksek host port appname prog' = let prog = getInit >>= prog' in forever $ 
     result <- runExceptT $ do
       SeksekResponse rbody (SeksekContinuation hid st) <- resp ?? "Couldn't decode a SeksekResponse from the job body"
       stArr <- maybeFromJSON st ?? "The state needs to be a JSON array"
-      instruction <- hoistEither $ stepSeksek 0 hid ([], V.toList stArr ++ [rbody] ) prog
+      instruction <- hoistEither $ stepSeksek 0 hid ([], stArr ++ [rbody] ) prog
       let handle (Ask handler cont inp _) = liftIO $ call_service con handler appname cont inp
           handle (Tell ()) = return ()
-          handle (Perform action cont) = do
-            out <- liftIO action
-            next <- hoistEither $ cont out
-            handle next
+          handle (Perform action cont) = performAction action cont >>= handle
       handle instruction
     case result of
       Right () -> deleteJob con $ job_id job
@@ -133,7 +132,10 @@ serveSeksek host port appname prog' = let prog = getInit >>= prog' in forever $ 
 readErr :: Read a => String -> IO (Either String a)
 readErr msg = fmap (note msg . readMay) getLine
 
-mockStep :: MonadIO m => Int -> [Value] -> SeksekProgram () -> ExceptT String m ()
+performAction :: IO a -> (a -> EitherInstruction b) -> ExceptInstruction IO b
+performAction action step = liftIO action >>= (hoistEither . step)
+
+mockStep :: Int -> [Value] -> SeksekProgram () -> ExceptT String IO ()
 mockStep stepId state prog = do
       instruction <- hoistEither $ stepSeksek stepId stepId (state,[]) prog
       let handle (Ask handler cont service_input rest) = do
@@ -143,24 +145,23 @@ mockStep stepId state prog = do
               putStrLn "Along with the continuation:"
               BSL.putStrLn $ encode cont
               putStrLn "Please enter a response mocking the service"
-            mockResponse' <- liftIO BS.getLine
-            mockResponse <- decodeStrict' mockResponse' ?? "Unable to decode the response"
-            let Success nextState = fromJSON $ appstate cont
-            mockStep (handler_id cont) nextState $ rest mockResponse
+            mockString <- liftIO BS.getLine
+            mockJSON <- decodeStrict' mockString ?? "Unable to decode a JSON value from mock response"
+            mockResponse <- maybeFromJSON mockJSON ?? "Unable to convert JSON to the expected type"
+            mockStep (handler_id cont) (appstate cont ++ [mockJSON]) $ rest mockResponse
           handle (Tell ()) = return ()
-          handle (Perform action cont) = do
-            out <- liftIO action
-            next <- hoistEither $ cont out
-            handle next
+          handle (Perform action cont) = performAction action cont >>= handle
       handle instruction
 
-mockSeksek :: (Typeable a, Read a) => (a -> SeksekProgram ()) -> IO ()
+mockSeksek :: (Typeable a, FromJSON a) => (a -> SeksekProgram ()) -> IO ()
 mockSeksek prog' = do
   result <- runExceptT $ do
     rec
-      liftIO $ putStrLn $ "Enter a value of type " ++ show (typeOf inp)
-      inp <- hoistEither =<< liftIO (readErr "Couldn't parse the value as the appropriate type")
-    mockStep 0 [] $ prog' inp
+      liftIO $ putStrLn $ "Enter a value of type " ++ show (typeOf inp) ++ " as JSON"
+      str <- liftIO BS.getLine
+      json <- decodeStrict' str ?? "Unable to decode a JSON value from input"
+      inp <- maybeFromJSON json ?? "Unable to convert JSON to the expected type"
+    mockStep 0 [json] $ prog' inp
   case result of
     Left err -> putStrLn $ "Error! " ++ err
     Right () -> putStrLn "Congrats!"
