@@ -9,20 +9,19 @@ test_service = SeksekHandler "test_service"
 
 testProg :: Double -> SeksekProgram ()
 testProg inp = do
-  usr <- remember $ do
+  forget $ do
     putStrLn $ "Received: " ++ show inp
     putStrLn "Input some number:"
-    usr <- readLn
-    putStrLn $ "Now sending:" ++ show (inp, usr)
-    return usr
-  let req = (inp, usr)
+  userInput <- remember readLn
+  let req = (inp, userInput)
+  forget $ putStrLn $ "Now sending:" ++ show req
   out <- remote test_service req
-  another <- remember $ do
+  forget $ do
     putStrLn $ "Received " ++ show out ++ " from test service for " ++ show req ++ "!"
     putStrLn "Let's try another number:"
-    readLn
+  another <- remember readLn
   final <- remote test_service (out, another)
-  remember $ putStrLn $ "Finally, received " ++ show final
+  forget $ putStrLn $ "Finally, received " ++ show final
 
 main :: IO ()
 main = serveSeksek "localhost" "11300" "heksektest" testProg

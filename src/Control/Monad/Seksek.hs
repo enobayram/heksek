@@ -2,8 +2,8 @@
 {-# OPTIONS_GHC -Wall -fno-warn-unused-binds #-}
 
 module Control.Monad.Seksek (
-  SeksekHandler(..), SeksekProgram, getInit, remote, remember, serveSeksek,
-  initialJob, sendJob, mockSeksek
+  SeksekHandler(..), SeksekProgram, getInit, remote, remember, forget,
+  serveSeksek, mockSeksek, initialJob, sendJob
   ) where
 
 import Network.Beanstalk (BeanstalkServer, connectBeanstalk, useTube, watchTube,
@@ -60,12 +60,16 @@ call_service con srv app cont i = do
 data Seksek a where
    Remote :: (ToJSON a, FromJSON b) => SeksekHandler a b -> a -> Seksek b
    Remember :: (ToJSON a, FromJSON a) => IO a -> Seksek a
+   Forget :: IO a -> Seksek ()
 
 remote :: (ToJSON a, FromJSON b) => SeksekHandler a b -> (a -> SeksekProgram b)
 remote h = singleton . Remote h
 
 remember :: (ToJSON a, FromJSON a) => IO a -> SeksekProgram a
 remember = singleton . Remember
+
+forget :: IO a -> SeksekProgram ()
+forget = singleton . Forget
 
 type SeksekProgram a = Program Seksek a
 
@@ -92,15 +96,17 @@ type EitherInstruction a = Either String (SeksekInstruction a)
 type ExceptInstruction m a = ExceptT String m (SeksekInstruction a)
 
 stepSeksek :: Int -> Int -> StateZipper -> SeksekProgram a -> EitherInstruction a
-stepSeksek curIdx hid (before, after) m = if curIdx < hid
-  then case view m of
+stepSeksek curIdx hid sz@(before, after) m = if curIdx < hid
+  then case view m of -- Replay Mode
     Return _ -> throwError "No more steps remaining"
     Remote _ _ :>>= k -> stepReplay k
     Remember _ :>>= k -> stepReplay k
-  else assertAfterEmpty >>| case view m of
+    Forget _   :>>= k -> stepSeksek (curIdx+1) hid sz $ k ()
+  else assertAfterEmpty >>| case view m of -- Execution Mode
     Return a -> Tell a
     Remote h a :>>= k -> Ask h (makeContinuation (curIdx+1) before) a k
     Remember a :>>= k -> Perform a $ \out -> stepSeksek (curIdx+1) hid (toJSON out:before, after) $ k out
+    Forget a   :>>= k -> Perform a $ \_   -> stepSeksek (curIdx+1) hid sz $ k ()
   where
     ma >>| b = ma >> return b
     stepReplay :: FromJSON b => (b -> SeksekProgram a) -> EitherInstruction a
