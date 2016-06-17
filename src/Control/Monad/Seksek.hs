@@ -2,7 +2,7 @@
 {-# OPTIONS_GHC -Wall -fno-warn-unused-binds #-}
 
 module Control.Monad.Seksek (
-  SeksekHandler(..), SeksekProgram, getInit, remote, remember, forget,
+  SeksekHandler(..), SeksekProgram, getInit, remote, remember, forget, nested,
   serveSeksek, mockSeksek, initialJob, sendJob
   ) where
 
@@ -63,7 +63,7 @@ data Seksek a where
    Remote :: (ToJSON a, FromJSON b) => SeksekHandler a b -> a -> Seksek b
    Remember :: (ToJSON a, FromJSON a) => IO a -> Seksek a
    Forget :: IO a -> Seksek ()
---   Nested :: (FromJSON a) => SeksekProgram a -> Seksek a
+   Nested :: (FromJSON a) => SeksekProgram a -> Seksek a
 
 remote :: (ToJSON a, FromJSON b) => SeksekHandler a b -> (a -> SeksekProgram b)
 remote h = singleton . Remote h
@@ -74,8 +74,8 @@ remember = singleton . Remember
 forget :: IO a -> SeksekProgram ()
 forget = singleton . Forget
 
--- nested :: SeksekProgram a -> SeksekProgram a
--- nested = singleton . Nested
+nested :: FromJSON a => SeksekProgram a -> SeksekProgram a
+nested = singleton . Nested
 
 type SeksekProgram a = Program Seksek a
 
@@ -136,6 +136,10 @@ zipperToList :: ListZipper a -> [a]
 zipperToList (ListZipper (b:bs) as) = zipperToList $ ListZipper bs (b:as)
 zipperToList (ListZipper [] as) = as
 
+cropZipper :: ListZipper a -> ListZipper a
+cropZipper (ListZipper bs (a:_)) = ListZipper bs [a]
+cropZipper (ListZipper bs []) = ListZipper bs []
+
 type StateZipper = ListZipper FrameZipper
 type FrameZipper = ListZipper Value
 type HandlerZipper = ListZipper Int
@@ -143,7 +147,7 @@ type HandlerZipper = ListZipper Int
 data SeksekInstruction a where
   Ask :: (ToJSON inp, FromJSON out) =>
     SeksekHandler inp out -> SeksekContinuation [[Value]] ->
-    inp -> (out -> SeksekProgram a) -> SeksekInstruction a
+    inp -> SeksekInstruction a
   Tell :: a -> SeksekInstruction a
   Perform :: IO out -> (out -> Either String (SeksekInstruction a)) -> SeksekInstruction a
 
@@ -168,7 +172,6 @@ stepSeksek curIdxs hz sz m = let
   stepFocused :: SeksekProgram a -> Int -> Int -> FrameZipper -> EitherInstruction a
   stepFocused p hid curIdx curframe =
     let
-      ma >>| b = ma >> return b
       stepReplay :: FromJSON b => (b -> SeksekProgram a) -> EitherInstruction a
       stepReplay cont = do
         (next, right) <- toRight curframe ?< "The state array is too short!"
@@ -184,11 +187,22 @@ stepSeksek curIdxs hz sz m = let
       Remote _ _ :>>= k -> stepReplay k
       Remember _ :>>= k -> stepReplay k
       Forget _   :>>= k -> stepSeksek nextIdxs hz sz $ k ()
-    else assertAfterEmpty >>| case view p of -- Execution Mode
-      Return a -> Tell a
-      Remote h a :>>= k -> Ask h (makeContinuation nextIdxs state) a k
-      Remember a :>>= k -> Perform a $ \out -> stepSeksek nextIdxs hz (modify sz (pushLeft $ toJSON out)) $ k out
-      Forget a   :>>= k -> Perform a $ \_   -> stepSeksek nextIdxs hz sz $ k ()
+      Nested _   :>>= k -> stepReplay k
+    else assertAfterEmpty >> case view p of -- Execution Mode
+      Return a -> return $ Tell a
+      Remote h a :>>= _ -> return $ Ask h (makeContinuation nextIdxs state) a
+      Remember a :>>= k -> return $ Perform a $ \out -> stepSeksek nextIdxs hz (modify sz (pushLeft $ toJSON out)) $ k out
+      Forget a   :>>= k -> return $ Perform a $ \_   -> stepSeksek nextIdxs hz sz $ k ()
+      Nested pN  :>>= k -> do
+        (_, nestedHid) <- toRight hz ?< "Can't nest into the handlers list, it's too short!"
+        (_, nestedSt)  <- toRight sz ?< "Can't nest into the state stack, it's too short!"
+        nestedResult <- stepSeksek (0:curIdxs) nestedHid nestedSt pN
+        let handleNested nestedInstruction =
+             case nestedInstruction of
+               Tell a -> return $ Perform (return a) $ \a' -> stepSeksek nextIdxs (cropZipper hz) (cropZipper sz) $ k a'
+               Ask h cont i -> return $ Ask h cont i
+               Perform a k' -> return $ Perform a $ k' >=> handleNested
+        handleNested nestedResult
   in gather (stepFocused m) (note "Handler list is too short!" (focused hz))
               (note "Internal rrror! Current index stack underflow" (headMay curIdxs))
               (note "State stack is too short!" (focused sz))
@@ -212,7 +226,7 @@ serveSeksek host port appname prog' = let prog = conditionProgram prog' in do
     result <- runExceptT $ do
       SeksekResponse rbody cont <- resp ?? "Couldn't decode a SeksekResponse from the job body"
       instruction <- hoistEither $ runSeksek rbody cont prog
-      let handle (Ask handler nextCont inp _) = liftIO $ call_service con handler appname nextCont inp
+      let handle (Ask handler nextCont inp) = liftIO $ call_service con handler appname nextCont inp
           handle (Tell ()) = return ()
           handle (Perform action nextCont) = performAction action nextCont >>= handle
       handle instruction
@@ -223,7 +237,7 @@ serveSeksek host port appname prog' = let prog = conditionProgram prog' in do
 mockSeksek' :: SeksekResponse Value [[Value]] -> SeksekProgram () -> ExceptT String IO ()
 mockSeksek' (SeksekResponse resp cont) prog = do
       instruction <- hoistEither $ runSeksek resp cont prog
-      let handle (Ask handler nextCont inp _) = do
+      let handle (Ask handler nextCont inp) = do
             liftIO $ do
               putStrLn $ "Handler " ++ show (tubeName handler) ++ " is called with input " ++ show (encode inp)
               putStrLn $ "Along with the continuation:" ++ show (encode nextCont)

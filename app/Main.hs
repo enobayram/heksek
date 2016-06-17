@@ -16,6 +16,9 @@ testProg inp = do
   let req = (inp, userInput)
   forget $ putStrLn $ "Now sending:" ++ show req
   out <- remote test_service req
+  nestedOut <- nested $ do
+    phony <- remember $ return 150
+    remote test_service (phony, userInput)
   forget $ do
     putStrLn $ "Received " ++ show out ++ " from test service for " ++ show req ++ "!"
     putStrLn "Let's try another number:"
