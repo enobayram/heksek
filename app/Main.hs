@@ -18,7 +18,8 @@ testProg inp = do
   out <- remote test_service req
   nestedOut <- nested $ do
     phony <- remember $ return 150
-    remote test_service (phony, userInput)
+    nestedRemote <- remote test_service (phony, userInput)
+    return $ phony + nestedRemote
   forget $ do
     putStrLn $ "Received " ++ show out ++ " from test service for " ++ show req ++ "!"
     putStrLn "Let's try another number:"

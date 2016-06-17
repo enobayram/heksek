@@ -22,7 +22,6 @@ import Control.Error.Util ((??), note, hoistEither)
 import Control.Monad.Operational (Program, singleton, view, ProgramViewT(..))
 import Control.Arrow (first)
 import Safe
--- import Debug.Trace
 
 data SeksekRequestMeta fwd = SeksekRequestMeta {
        response_tube :: String
@@ -63,7 +62,7 @@ data Seksek a where
    Remote :: (ToJSON a, FromJSON b) => SeksekHandler a b -> a -> Seksek b
    Remember :: (ToJSON a, FromJSON a) => IO a -> Seksek a
    Forget :: IO a -> Seksek ()
-   Nested :: (FromJSON a) => SeksekProgram a -> Seksek a
+   Nested :: (ToJSON a, FromJSON a) => SeksekProgram a -> Seksek a
 
 remote :: (ToJSON a, FromJSON b) => SeksekHandler a b -> (a -> SeksekProgram b)
 remote h = singleton . Remote h
@@ -74,7 +73,7 @@ remember = singleton . Remember
 forget :: IO a -> SeksekProgram ()
 forget = singleton . Forget
 
-nested :: FromJSON a => SeksekProgram a -> SeksekProgram a
+nested :: (ToJSON a, FromJSON a) => SeksekProgram a -> SeksekProgram a
 nested = singleton . Nested
 
 type SeksekProgram a = Program Seksek a
@@ -160,12 +159,15 @@ gather f a b c = (\(a',b',c') -> f a' b' c') =<< (,,) <$> a <*> b <*> c
 type EitherInstruction a = Either String (SeksekInstruction a)
 type ExceptInstruction m a = ExceptT String m (SeksekInstruction a)
 
+withDefault :: ListZipper a -> a -> ListZipper a
+withDefault lz@(ListZipper _ (_:_)) _ = lz
+withDefault (ListZipper bs []) def = ListZipper bs [def]
+
 runSeksek :: Value -> SeksekContinuation [[Value]] -> SeksekProgram a -> EitherInstruction a
 runSeksek resp (SeksekContinuation hid state') prog =
-  let state = maybe [[resp]] (\(as, ass) -> ((as ++ [resp]):ass)) $ safeSplit state' :: [[Value]]
+  let state = maybe [[resp]] (\(ass, as) -> ass ++ [as ++ [resp]]) $ safeSplitEnd state' :: [[Value]]
       statezipper = listToZipper2 state
   in stepSeksek [0] (listToZipper hid) statezipper prog
-
 
 stepSeksek :: [Int] -> HandlerZipper -> StateZipper -> SeksekProgram a -> EitherInstruction a
 stepSeksek curIdxs hz sz m = let
@@ -177,7 +179,8 @@ stepSeksek curIdxs hz sz m = let
         (next, right) <- toRight curframe ?< "The state array is too short!"
         out <- maybeFromJSON next ?< ("Failed to decode output from seksek response:" ++ show next)
         stepSeksek nextIdxs hz (putFrame right) $ cont out
-      assertAfterEmpty = unless (isNothing $ toRight curframe) $ throwError "Internal Error! The 'after' list should be empty."
+      assertAfterEmpty = unless (isNothing $ toRight curframe) $
+        throwError $ "Internal Error! The 'after' list should be empty." ++ show sz
       state = zipperToList $ fmap zipperToList sz :: [[Value]]
       nextIdxs = (curIdx+1: tail curIdxs)
       putFrame f = modify sz (const f)
@@ -190,21 +193,23 @@ stepSeksek curIdxs hz sz m = let
       Nested _   :>>= k -> stepReplay k
     else assertAfterEmpty >> case view p of -- Execution Mode
       Return a -> return $ Tell a
-      Remote h a :>>= _ -> return $ Ask h (makeContinuation nextIdxs state) a
+      Remote h a :>>= _ -> return $ Ask h (makeContinuation (reverse nextIdxs) state) a
       Remember a :>>= k -> return $ Perform a $ \out -> stepSeksek nextIdxs hz (modify sz (pushLeft $ toJSON out)) $ k out
       Forget a   :>>= k -> return $ Perform a $ \_   -> stepSeksek nextIdxs hz sz $ k ()
       Nested pN  :>>= k -> do
-        (_, nestedHid) <- toRight hz ?< "Can't nest into the handlers list, it's too short!"
-        (_, nestedSt)  <- toRight sz ?< "Can't nest into the state stack, it's too short!"
+        (_, nestedHid') <- toRight hz ?< "Can't nest into the handlers list, it's too short!"
+        (_, nestedSt')  <- toRight sz ?< "Can't nest into the state stack, it's too short!"
+        let nestedHid = withDefault nestedHid' 0
+        let nestedSt  = withDefault nestedSt' (listToZipper [])
         nestedResult <- stepSeksek (0:curIdxs) nestedHid nestedSt pN
         let handleNested nestedInstruction =
              case nestedInstruction of
-               Tell a -> return $ Perform (return a) $ \a' -> stepSeksek nextIdxs (cropZipper hz) (cropZipper sz) $ k a'
+               Tell a -> return $ Perform (return a) $ \a' -> stepSeksek nextIdxs (cropZipper hz) (modify (cropZipper sz) (pushLeft $ toJSON a')) $ k a'
                Ask h cont i -> return $ Ask h cont i
                Perform a k' -> return $ Perform a $ k' >=> handleNested
         handleNested nestedResult
   in gather (stepFocused m) (note "Handler list is too short!" (focused hz))
-              (note "Internal rrror! Current index stack underflow" (headMay curIdxs))
+              (note "Internal error! Current index stack underflow" (headMay curIdxs))
               (note "State stack is too short!" (focused sz))
 
 conditionProgram :: FromJSON a => (a -> SeksekProgram b) -> SeksekProgram b
@@ -239,8 +244,8 @@ mockSeksek' (SeksekResponse resp cont) prog = do
       instruction <- hoistEither $ runSeksek resp cont prog
       let handle (Ask handler nextCont inp) = do
             liftIO $ do
-              putStrLn $ "Handler " ++ show (tubeName handler) ++ " is called with input " ++ show (encode inp)
-              putStrLn $ "Along with the continuation:" ++ show (encode nextCont)
+              putStrLn $ "Handler " ++ show (tubeName handler) ++ " is called with input " ++ BSL.unpack (encode inp)
+              putStrLn $ "Along with the continuation:" ++ BSL.unpack (encode nextCont)
             mock <- receiveMock
             mockSeksek' (SeksekResponse mock nextCont) prog
           handle (Tell ()) = return ()
