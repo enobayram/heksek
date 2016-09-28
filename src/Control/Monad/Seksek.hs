@@ -15,7 +15,7 @@ import Data.Aeson (defaultOptions, Value, ToJSON, FromJSON, encode,
                    toJSON, fromJSON, decodeStrict', Result(Success))
 import Data.Aeson.TH (deriveJSON)
 import Data.String (fromString)
-import Data.Maybe (isNothing, fromJust)
+import Data.Maybe (isNothing)
 import Control.Monad.Except (throwError, liftIO, runExceptT, ExceptT)
 import Control.Monad
 import Control.Error.Util ((??), note, hoistEither)
@@ -174,65 +174,67 @@ withDefault (ListZipper bs []) def = ListZipper bs [def]
 runSeksek :: Value -> SeksekContinuation [Value] -> SeksekProgram a -> EitherInstruction a
 runSeksek resp (SeksekContinuation hid state') prog =
   let state = listToZipper state'
-  in stepSeksek 0 hid (Just resp) state prog
+  in replaySeksek 0 hid resp state prog
 
 assertLast :: FrameZipper -> Either String ()
 assertLast frame = unless (isNothing $ toRight frame) $
   throwError $ "Internal Error! The 'after' list should be empty." ++ show frame
 
 
-stepSeksek :: Int -> Int -> Maybe Value -> FrameZipper -> SeksekProgram a -> EitherInstruction a
-stepSeksek curIdx hid resp curframe p = let
+replaySeksek :: Int -> Int -> Value -> FrameZipper -> SeksekProgram a -> EitherInstruction a
+replaySeksek curIdx hid resp curframe p = let
       nextIdx = curIdx+1
       stepReplay :: FromJSON b => (b -> SeksekProgram a) -> EitherInstruction a
       stepReplay cont = do
         (next, right) <- toRight curframe ?< "The state array is too short!"
         out <- maybeFromJSON next ?< ("Failed to decode output from seksek response:" ++ show next ++ show curIdx)
-        stepSeksek nextIdx hid resp right $ cont out
+        replaySeksek nextIdx hid resp right $ cont out
       getOneAfter :: Either String Value
       getOneAfter = case toRight curframe of
         Nothing -> throwError $ "Internal Error! The state array is too short for nested!" ++ show curframe
         Just (nextVal, nextFrame) -> case toRight nextFrame of
           Nothing -> return nextVal
           Just _  -> throwError $ "Internal Error! The state array is too long!" ++ show curframe
-      handleNested :: (ToJSON a) => (a -> SeksekProgram b) -> SeksekInstruction a -> EitherInstruction b
-      handleNested k nestedInstruction =
-           case nestedInstruction of
-             Tell a -> return $ Perform (return a) $ \a' -> stepSeksek nextIdx hid Nothing (snd $ fromJust $ toRight $ modifyInsert curframe $ toJSON a') $ k a'
-             Ask h (SeksekContinuation nestedNext nestedNextSt) i -> return $ Ask h wrappedNested i
-               where wrappedNested = SeksekContinuation curIdx $ zipperToList $ modifyInsert curframe $ toJSON (nestedNext, nestedNextSt)
-             Perform a k' -> return $ Perform a $ k' >=> handleNested k
     in case compare curIdx hid of
       LT -> case view p of -- Replay Mode
         Return _ -> throwError "No more steps remaining"
-        Forget _   :>>= k -> stepSeksek nextIdx hid resp curframe $ k ()
+        Forget _   :>>= k -> replaySeksek nextIdx hid resp curframe $ k ()
         Remote _ _ :>>= k -> stepReplay k
         Remember _ :>>= k -> stepReplay k
         Nested _  :>>= k -> stepReplay k
 
       EQ -> case view p of -- Recover Mode
         Remote _ _ :>>= k -> do
-          r <- resp ?< "Internal Error! Null response to a Remote instruction"
-          out <- maybeFromJSON r ?< ("Failed to decode output from seksek response:" ++ show r)
-          stepSeksek nextIdx hid Nothing (pushLeft r curframe) $ k out
+          out <- maybeFromJSON resp ?< ("Failed to decode output from seksek response:" ++ show resp)
+          executeSeksek nextIdx (zipperToList curframe ++ [resp]) $ k out
         Nested pN  :>>= k -> do
-          nestedCont  <- getOneAfter
-          (nestedHid, nestedSt') <- maybeFromJSON nestedCont ?< "Internal Error! The JSON value can't be decoded as a nested continuation"
-          let nestedSt = listToZipper nestedSt'
-          nestedResult <- stepSeksek 0 nestedHid resp nestedSt pN
-          handleNested k nestedResult
+          nestedCont'  <- getOneAfter
+          nestedCont <- maybeFromJSON nestedCont' ?< "Internal Error! The JSON value can't be decoded as a nested continuation"
+          nestedResult <- runSeksek resp nestedCont pN
+          handleNested curIdx (init $ zipperToList curframe) k nestedResult
         _ -> throwError $ "The handler(" ++ show curIdx ++ ") of the job is not a Nested or Remote!"
 
-      GT -> case view p of -- Execution Mode
-        Return a -> assertLast curframe >> return (Tell a)
-        Remote h a :>>= _ -> assertLast curframe >> return (Ask h (makeContinuation curIdx $ zipperToList curframe) a)
-        Remember a :>>= k -> assertLast curframe >> return (Perform a $ \out -> stepSeksek nextIdx hid Nothing (pushLeft (toJSON out) curframe) $ k out)
-        Forget a   :>>= k -> assertLast curframe >> return (Perform a $ \_   -> stepSeksek nextIdx hid Nothing curframe $ k ())
-        Nested pN  :>>= k -> do
-          let nestedHid = -1
-              nestedSt = listToZipper []
-          nestedResult <- stepSeksek 0 nestedHid Nothing nestedSt pN
-          handleNested k nestedResult
+      GT -> throwError "Internal error, curIdx cannot exceed hid in replaySeksek"
+
+executeSeksek :: Int -> [Value] -> SeksekProgram a -> EitherInstruction a
+executeSeksek curIdx state p = let nextIdx = curIdx+1 in
+  case view p of
+    Return a -> return (Tell a)
+    Remote h a :>>= _ -> return (Ask h (makeContinuation curIdx state) a)
+    Remember a :>>= k -> return (Perform a $ \out -> executeSeksek nextIdx (state ++ [toJSON out]) $ k out)
+    Forget a   :>>= k -> return (Perform a $ \_   -> executeSeksek nextIdx state $ k ())
+    Nested pN  :>>= k -> do
+      nestedResult <- executeSeksek 0 [] pN
+      handleNested curIdx state k nestedResult
+
+handleNested :: (ToJSON a) => Int -> [Value] -> (a -> SeksekProgram b) -> SeksekInstruction a -> EitherInstruction b
+handleNested curIdx state k nestedInstruction = let nextIdx = curIdx+1 in
+     case nestedInstruction of
+       Tell a -> return $ Perform (return a) $ \a' -> executeSeksek nextIdx (state ++ [toJSON a']) $ k a'
+       Ask h cont i -> return $ Ask h wrappedNested i
+         where wrappedNested = SeksekContinuation curIdx $ state ++ [toJSON cont]
+       Perform a k' -> return $ Perform a $ k' >=> handleNested curIdx state k
+
 
 conditionProgram :: FromJSON a => (a -> SeksekProgram b) -> SeksekProgram b
 conditionProgram prog = getInit >>= prog
