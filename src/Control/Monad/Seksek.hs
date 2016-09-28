@@ -176,23 +176,25 @@ runSeksek resp (SeksekContinuation hid state') prog =
   let state = listToZipper state'
   in stepSeksek 0 hid (Just resp) state prog
 
+assertLast :: FrameZipper -> Either String ()
+assertLast frame = unless (isNothing $ toRight frame) $
+  throwError $ "Internal Error! The 'after' list should be empty." ++ show frame
+
+
 stepSeksek :: Int -> Int -> Maybe Value -> FrameZipper -> SeksekProgram a -> EitherInstruction a
 stepSeksek curIdx hid resp curframe p = let
+      nextIdx = curIdx+1
       stepReplay :: FromJSON b => (b -> SeksekProgram a) -> EitherInstruction a
       stepReplay cont = do
         (next, right) <- toRight curframe ?< "The state array is too short!"
         out <- maybeFromJSON next ?< ("Failed to decode output from seksek response:" ++ show next ++ show curIdx)
         stepSeksek nextIdx hid resp right $ cont out
-      assertAfterEmpty :: Either String ()
-      assertAfterEmpty = unless (isNothing $ toRight curframe) $
-        throwError $ "Internal Error! The 'after' list should be empty." ++ show curframe
+      getOneAfter :: Either String Value
       getOneAfter = case toRight curframe of
         Nothing -> throwError $ "Internal Error! The state array is too short for nested!" ++ show curframe
         Just (nextVal, nextFrame) -> case toRight nextFrame of
           Nothing -> return nextVal
           Just _  -> throwError $ "Internal Error! The state array is too long!" ++ show curframe
-      state = zipperToList curframe :: [Value]
-      nextIdx = curIdx+1
       handleNested :: (ToJSON a) => (a -> SeksekProgram b) -> SeksekInstruction a -> EitherInstruction b
       handleNested k nestedInstruction =
            case nestedInstruction of
@@ -200,28 +202,32 @@ stepSeksek curIdx hid resp curframe p = let
              Ask h (SeksekContinuation nestedNext nestedNextSt) i -> return $ Ask h wrappedNested i
                where wrappedNested = SeksekContinuation curIdx $ zipperToList $ modifyInsert curframe $ toJSON (nestedNext, nestedNextSt)
              Perform a k' -> return $ Perform a $ k' >=> handleNested k
-    in if curIdx <= hid
-      then case view p of -- Replay Mode
+    in case compare curIdx hid of
+      LT -> case view p of -- Replay Mode
         Return _ -> throwError "No more steps remaining"
-        Remote _ _ :>>= k -> if curIdx /= hid then stepReplay k
-          else do
-            r <- resp ?< "Internal Error! Null response to a Remote instruction"
-            out <- maybeFromJSON r ?< ("Failed to decode output from seksek response:" ++ show r)
-            stepSeksek nextIdx hid Nothing (pushLeft r curframe) $ k out
-        Remember _ :>>= k -> stepReplay k
         Forget _   :>>= k -> stepSeksek nextIdx hid resp curframe $ k ()
-        Nested pN  :>>= k -> if curIdx /= hid then stepReplay k
-          else do
-            nestedCont  <- getOneAfter
-            (nestedHid, nestedSt') <- maybeFromJSON nestedCont ?< "Internal Error! The JSON value can't be decoded as a nested continuation"
-            let nestedSt = listToZipper nestedSt'
-            nestedResult <- stepSeksek 0 nestedHid resp nestedSt pN
-            handleNested k nestedResult
-      else case view p of -- Execution Mode
-        Return a -> assertAfterEmpty >> return (Tell a)
-        Remote h a :>>= _ -> assertAfterEmpty >> return (Ask h (makeContinuation curIdx state) a)
-        Remember a :>>= k -> assertAfterEmpty >> return (Perform a $ \out -> stepSeksek nextIdx hid Nothing (pushLeft (toJSON out) curframe) $ k out)
-        Forget a   :>>= k -> assertAfterEmpty >> return (Perform a $ \_   -> stepSeksek nextIdx hid Nothing curframe $ k ())
+        Remote _ _ :>>= k -> stepReplay k
+        Remember _ :>>= k -> stepReplay k
+        Nested _  :>>= k -> stepReplay k
+
+      EQ -> case view p of -- Recover Mode
+        Remote _ _ :>>= k -> do
+          r <- resp ?< "Internal Error! Null response to a Remote instruction"
+          out <- maybeFromJSON r ?< ("Failed to decode output from seksek response:" ++ show r)
+          stepSeksek nextIdx hid Nothing (pushLeft r curframe) $ k out
+        Nested pN  :>>= k -> do
+          nestedCont  <- getOneAfter
+          (nestedHid, nestedSt') <- maybeFromJSON nestedCont ?< "Internal Error! The JSON value can't be decoded as a nested continuation"
+          let nestedSt = listToZipper nestedSt'
+          nestedResult <- stepSeksek 0 nestedHid resp nestedSt pN
+          handleNested k nestedResult
+        _ -> throwError $ "The handler(" ++ show curIdx ++ ") of the job is not a Nested or Remote!"
+
+      GT -> case view p of -- Execution Mode
+        Return a -> assertLast curframe >> return (Tell a)
+        Remote h a :>>= _ -> assertLast curframe >> return (Ask h (makeContinuation curIdx $ zipperToList curframe) a)
+        Remember a :>>= k -> assertLast curframe >> return (Perform a $ \out -> stepSeksek nextIdx hid Nothing (pushLeft (toJSON out) curframe) $ k out)
+        Forget a   :>>= k -> assertLast curframe >> return (Perform a $ \_   -> stepSeksek nextIdx hid Nothing curframe $ k ())
         Nested pN  :>>= k -> do
           let nestedHid = -1
               nestedSt = listToZipper []
