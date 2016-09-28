@@ -20,8 +20,6 @@ import Control.Monad.Except (throwError, liftIO, runExceptT, ExceptT)
 import Control.Monad
 import Control.Error.Util ((??), note, hoistEither)
 import Control.Monad.Operational (Program, singleton, view, ProgramViewT(..))
-import Control.Arrow (first)
-import Safe
 
 data SeksekRequestMeta fwd = SeksekRequestMeta {
        response_tube :: String
@@ -89,67 +87,22 @@ safeSplit :: [a] -> Maybe (a, [a])
 safeSplit (a:as) = Just (a,as)
 safeSplit [] = Nothing
 
-safeSplitEnd :: [a] -> Maybe ([a], a)
-safeSplitEnd (a:as) = Just $ maybe ([],a) (first (a:)) $ safeSplitEnd as
-safeSplitEnd [] = Nothing
-
-
 data ListZipper a = ListZipper {zbefore :: [a], zafter :: [a]} deriving (Functor, Show)
 
 (<&>) :: Functor f => f a -> (a -> b) -> f b
 (<&>) = flip (<$>)
 
-(&) :: a -> (a -> b) -> b
-(&) = flip ($)
-
 listToZipper :: [a] -> ListZipper a
 listToZipper = ListZipper []
 
-listToZipper2 :: [[a]] -> ListZipper (ListZipper a)
-listToZipper2 = listToZipper . fmap listToZipper
-
-listToZipperRight :: [a] -> ListZipper a
-listToZipperRight (a:as) = ListZipper as [a]
-listToZipperRight [] = ListZipper [] []
-
-listToZipperRight2 :: [[a]] -> ListZipper (ListZipper a)
-listToZipperRight2 = listToZipperRight . fmap listToZipperRight
-
-
-focused :: ListZipper a -> Maybe a
-focused (ListZipper _ as) = headMay as
-
 toRight :: ListZipper a -> Maybe (a, ListZipper a)
 toRight (ListZipper bs as) = safeSplit as <&> \(a, rest) -> (a, ListZipper (a:bs) rest)
-
-toLeft :: ListZipper a -> Maybe (a, ListZipper a)
-toLeft (ListZipper bs as) = safeSplit bs <&> \(b, rest) -> (b, ListZipper rest (b:as))
-
-pushLeft :: a -> ListZipper a -> ListZipper a
-pushLeft a (ListZipper bs as) = ListZipper (a:bs) as
-
-append :: a -> ListZipper a -> ListZipper a
-append a (ListZipper bs as) = ListZipper bs (as ++ [a])
-
-modify :: ListZipper a -> (a -> a) -> ListZipper a
-modify (ListZipper bs (a:as)) f = ListZipper bs (f a:as)
-modify lz@(ListZipper _ []) _ = lz
-
-modifyInsert :: ListZipper a -> a -> ListZipper a
-modifyInsert (ListZipper bs (_:as)) new = ListZipper bs (new:as)
-modifyInsert (ListZipper bs []) new = ListZipper bs [new]
 
 zipperToList :: ListZipper a -> [a]
 zipperToList (ListZipper (b:bs) as) = zipperToList $ ListZipper bs (b:as)
 zipperToList (ListZipper [] as) = as
 
-cropZipper :: ListZipper a -> ListZipper a
-cropZipper (ListZipper bs (a:_)) = ListZipper bs [a]
-cropZipper (ListZipper bs []) = ListZipper bs []
-
-type StateZipper = ListZipper FrameZipper
 type FrameZipper = ListZipper Value
-type HandlerZipper = ListZipper Int
 
 data SeksekInstruction a where
   Ask :: (ToJSON inp, FromJSON out) =>
@@ -161,15 +114,8 @@ data SeksekInstruction a where
 (?<) :: Maybe b -> a -> Either a b
 (?<) = flip note
 
-gather :: Monad m => (a -> b -> c -> m d) -> m a -> m b -> m c -> m d
-gather f a b c = (\(a',b',c') -> f a' b' c') =<< (,,) <$> a <*> b <*> c
-
 type EitherInstruction a = Either String (SeksekInstruction a)
 type ExceptInstruction m a = ExceptT String m (SeksekInstruction a)
-
-withDefault :: ListZipper a -> a -> ListZipper a
-withDefault lz@(ListZipper _ (_:_)) _ = lz
-withDefault (ListZipper bs []) def = ListZipper bs [def]
 
 runSeksek :: Value -> SeksekContinuation [Value] -> SeksekProgram a -> EitherInstruction a
 runSeksek resp (SeksekContinuation hid state') prog =
@@ -179,7 +125,6 @@ runSeksek resp (SeksekContinuation hid state') prog =
 assertLast :: FrameZipper -> Either String ()
 assertLast frame = unless (isNothing $ toRight frame) $
   throwError $ "Internal Error! The 'after' list should be empty." ++ show frame
-
 
 replaySeksek :: Int -> Int -> Value -> FrameZipper -> SeksekProgram a -> EitherInstruction a
 replaySeksek curIdx hid resp curframe p = let
@@ -238,9 +183,6 @@ handleNested curIdx state k nestedInstruction = let nextIdx = curIdx+1 in
 
 conditionProgram :: FromJSON a => (a -> SeksekProgram b) -> SeksekProgram b
 conditionProgram prog = getInit >>= prog
-
-readErr :: Read a => String -> IO (Either String a)
-readErr msg = fmap (note msg . readMay) getLine
 
 performAction :: IO a -> (a -> EitherInstruction b) -> ExceptInstruction IO b
 performAction action step = liftIO action >>= (hoistEither . step)
