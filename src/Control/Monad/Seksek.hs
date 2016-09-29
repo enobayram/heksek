@@ -217,16 +217,22 @@ conditionProgram prog = getInit >>= prog
 performAction :: IO a -> (a -> EitherInstruction b) -> ExceptInstruction IO b
 performAction action step = liftIO action >>= (hoistEither . step)
 
+responseOrInitial :: BS.ByteString -> Maybe (Value, SeksekContinuation [Value])
+responseOrInitial body = case decodeStrict' body of
+  Nothing -> Nothing
+  Just value -> case maybeFromJSON value of
+    Just (SeksekResponse resp cont) -> Just (resp, cont)
+    Nothing -> Just (value, SeksekContinuation 0 [])
+
 serveSeksek :: FromJSON a => String -> String -> String -> (a -> SeksekProgram ()) -> IO ()
 serveSeksek host port appname prog' = let prog = conditionProgram prog' in do
   con <- connectBeanstalk host port
   forever $ do
     _ <- watchTube con $ BS.pack appname
     job <- reserveJob con
-    let resp = decodeStrict' $ job_body job :: Maybe (SeksekResponse Value [Value])
     result <- runExceptT $ do
-      SeksekResponse rbody cont <- resp ?? "Couldn't decode a SeksekResponse from the job body"
-      instruction <- hoistEither $ runSeksek rbody cont prog
+      (resp, cont) <- responseOrInitial (job_body job) ?? "Couldn't decode the job body"
+      instruction <- hoistEither $ runSeksek resp cont prog
       let handle (Ask handler nextCont inp) = liftIO $ call_service con handler appname nextCont inp
           handle (Tell ()) = return ()
           handle (Perform action nextCont) = performAction action nextCont >>= handle
@@ -275,7 +281,7 @@ getInit :: FromJSON a => SeksekProgram a
 getInit = remote (SeksekHandler $ fromString "") ()
 
 initialJob :: ToJSON a => a -> BS.ByteString
-initialJob a = BSL.toStrict $ encode $ SeksekResponse a $ SeksekContinuation 0 ([] :: [Value])
+initialJob a = BSL.toStrict $ encode a
 
 sendJob :: ToJSON a => String -> String -> String -> a -> IO (JobState, Int)
 sendJob host port appname a = do
