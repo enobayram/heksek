@@ -8,7 +8,7 @@ module Control.Monad.Seksek (
 
 import Network.Beanstalk (BeanstalkServer, connectBeanstalk, useTube, watchTube,
                           putJob, reserveJob, deleteJob, buryJob, job_body,
-                          job_id, JobState)
+                          job_id, JobState, disconnectBeanstalk)
 import qualified Data.ByteString.Lazy.Char8 as BSL
 import qualified Data.ByteString.Char8 as BS
 import Data.Aeson (defaultOptions, Value, ToJSON, FromJSON, encode,
@@ -228,10 +228,12 @@ responseOrInitial body = case decodeStrict' body of
 showException :: E.SomeException -> IO (Either String a)
 showException e = return $ Left $ show e
 
+withConnection :: String -> String -> (BeanstalkServer -> IO a) -> IO a
+withConnection host port = E.bracket (connectBeanstalk host port) disconnectBeanstalk
+
 serveSeksek :: FromJSON a => String -> String -> String -> (a -> SeksekProgram ()) -> IO ()
-serveSeksek host port appname prog' = let prog = conditionProgram prog' in do
-  con <- connectBeanstalk host port
-  forever $ do
+serveSeksek host port appname prog' = let prog = conditionProgram prog'
+  in withConnection host port $ \con -> forever $ do
     _ <- watchTube con $ BS.pack appname
     job <- reserveJob con
     result <- E.handle showException $ runExceptT $ do
@@ -288,7 +290,6 @@ initialJob :: ToJSON a => a -> BS.ByteString
 initialJob a = BSL.toStrict $ encode a
 
 sendJob :: ToJSON a => String -> String -> String -> a -> IO (JobState, Int)
-sendJob host port appname a = do
-  con <- connectBeanstalk host port
+sendJob host port appname a = withConnection host port $ \con -> do
   useTube con $ fromString appname
   putJob con 0 0 100 $ initialJob a
