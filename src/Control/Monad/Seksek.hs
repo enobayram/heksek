@@ -17,9 +17,10 @@ import Data.Aeson.TH (deriveJSON, SumEncoding(TwoElemArray), Options(sumEncoding
 import Data.String (fromString)
 import Data.Maybe (isNothing)
 import Control.Monad.Except (throwError, liftIO, runExceptT, ExceptT)
-import Control.Monad
+import Control.Monad (unless, (>=>), forever)
 import Control.Error.Util ((??), note, hoistEither)
 import Control.Monad.Operational (Program, singleton, view, ProgramViewT(..))
+import qualified Control.Exception as E
 
 data SeksekRequestMeta fwd = SeksekRequestMeta {
        response_tube :: String
@@ -224,13 +225,16 @@ responseOrInitial body = case decodeStrict' body of
     Just (SeksekResponse resp cont) -> Just (resp, cont)
     Nothing -> Just (value, SeksekContinuation 0 [])
 
+showException :: E.SomeException -> IO (Either String a)
+showException e = return $ Left $ show e
+
 serveSeksek :: FromJSON a => String -> String -> String -> (a -> SeksekProgram ()) -> IO ()
 serveSeksek host port appname prog' = let prog = conditionProgram prog' in do
   con <- connectBeanstalk host port
   forever $ do
     _ <- watchTube con $ BS.pack appname
     job <- reserveJob con
-    result <- runExceptT $ do
+    result <- E.handle showException $ runExceptT $ do
       (resp, cont) <- responseOrInitial (job_body job) ?? "Couldn't decode the job body"
       instruction <- hoistEither $ runSeksek resp cont prog
       let handle (Ask handler nextCont inp) = liftIO $ call_service con handler appname nextCont inp
