@@ -26,7 +26,7 @@ testProg inp = do
   another <- remember readLn
   final <- remote test_service (out, another)
   forget $ putStrLn $ "Finally, received " ++ show final
-  chainOut <- chain test_service (\x -> (x,x)) $ remote test_service (userInput, another)
+  chainOut <- test_service <$< (\x -> (x,x)) <:$> test_service <$< (\x -> (x,x)) <:$> remote test_service (userInput, another)
   forget $ putStrLn $ "Chain output:" ++ show chainOut
 
 main :: IO ()

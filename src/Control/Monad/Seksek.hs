@@ -3,7 +3,7 @@
 
 module Control.Monad.Seksek (
   SeksekHandler(..), SeksekProgram, getInit, remote, remember, forget, nested,
-  chain, serveSeksek, mockSeksek, initialJob, sendJob
+  chain, serveSeksek, mockSeksek, initialJob, sendJob, (<$<), (<:$>)
   ) where
 
 import Network.Beanstalk (BeanstalkServer, connectBeanstalk, useTube, watchTube,
@@ -61,7 +61,7 @@ data Seksek a where
    Remote :: (ToJSON a, FromJSON b) => SeksekHandler a b -> a -> Seksek b
    Remember :: (ToJSON a, FromJSON a) => IO a -> Seksek a
    Forget :: IO a -> Seksek ()
-   Chain :: (ToJSON b, FromJSON c) => SeksekHandler b c -> (a -> b) -> SeksekProgram a -> Seksek c
+   Chain :: (ToJSON a, FromJSON b) => SeksekHandler a b -> SeksekProgram a -> Seksek b
    Nested :: (ToJSON a, FromJSON a) => SeksekProgram a -> Seksek a
 
 remote :: (ToJSON a, FromJSON b) => SeksekHandler a b -> (a -> SeksekProgram b)
@@ -73,8 +73,16 @@ remember = singleton . Remember
 forget :: IO a -> SeksekProgram ()
 forget = singleton . Forget
 
-chain :: (ToJSON b, FromJSON c) => SeksekHandler b c -> (a -> b) -> SeksekProgram a -> SeksekProgram c
-chain h f = singleton . Chain h f
+chain :: (ToJSON a, FromJSON b) => SeksekHandler a b -> SeksekProgram a -> SeksekProgram b
+chain h = singleton . Chain h
+
+infixr 3 <$<
+(<$<) :: (ToJSON a, FromJSON b) => SeksekHandler a b -> SeksekProgram a -> SeksekProgram b
+(<$<) = chain
+
+infixr 3 <:$>
+(<:$>) :: Functor f => (a->b) -> f a -> f b
+(<:$>) = fmap
 
 nested :: (ToJSON a, FromJSON a) => SeksekProgram a -> SeksekProgram a
 nested = singleton . Nested
@@ -170,7 +178,7 @@ replaySeksek curIdx hid resp curframe p = let
         Nested pN  :>>= k -> runNested pN completionHandler cR
           where completionHandler a = Perform (return a) $ \a' -> executeSeksek nextIdx (stateBeforeNesting ++ [toJSON a']) $ k a'
                 cR c = makeContinuation curIdx $ stateBeforeNesting ++ [toJSON c]
-        Chain h f pN :>>= k -> do
+        Chain h pN :>>= k -> do
           chainCont'  <- getOneAfter
           chainCont <- maybeFromJSON chainCont' ?< "Internal Error! The JSON value can't be decoded as a chain continuation"
           case chainCont of
@@ -178,7 +186,7 @@ replaySeksek curIdx hid resp curframe p = let
             Ongoing nestedCont -> do
               nestedResult <- runSeksek resp nestedCont pN
               handleNested curIdx cR cH nestedResult
-                where cH a = Ask h (makeContinuation curIdx $ stateBeforeNesting ++ [toJSON Completed]) (f a)
+                where cH = Ask h (makeContinuation curIdx $ stateBeforeNesting ++ [toJSON Completed])
                       cR c = makeContinuation curIdx $ stateBeforeNesting ++ [toJSON $ Ongoing c]
         _ -> throwError $ "The handler(" ++ show curIdx ++ ") of the job is not a Nested, Chain or Remote!"
 
@@ -196,10 +204,10 @@ executeSeksek curIdx state p = let nextIdx = curIdx+1 in
       handleNested curIdx cR completionHandler nestedResult
         where completionHandler a = Perform (return a) $ \a' -> executeSeksek nextIdx (state ++ [toJSON a']) $ k a'
               cR c = makeContinuation curIdx $ state ++ [toJSON c]
-    Chain h f pN :>>= _ -> do
+    Chain h pN :>>= _ -> do
       nestedResult <- executeSeksek 0 [] pN
       handleNested curIdx cR cH nestedResult
-        where cH a = Ask h (makeContinuation curIdx $ state ++ [toJSON Completed]) (f a)
+        where cH = Ask h (makeContinuation curIdx $ state ++ [toJSON Completed])
               cR c = makeContinuation curIdx $ state ++ [toJSON $ Ongoing c]
 
 handleNested :: Int -> (SeksekContinuation [Value] -> SeksekContinuation [Value]) ->
